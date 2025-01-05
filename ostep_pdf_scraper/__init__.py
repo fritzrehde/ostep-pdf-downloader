@@ -3,6 +3,7 @@ from io import BytesIO
 import logging
 import os
 from pprint import pprint
+import sys
 from typing import List, Tuple
 from urllib.parse import urljoin
 from bs4 import BeautifulSoup, Tag
@@ -10,6 +11,9 @@ import pymupdf
 import requests
 import requests_cache
 
+
+# TODO: maybe crop down to A4
+# TODO: maybe make as much as possible return iterators/generators instead of lists
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
 
@@ -28,26 +32,6 @@ class Chapter:
 
 
 @dataclass
-class Part:
-    title: str
-    page_num: int
-    chapters: List[Chapter]
-
-
-@dataclass
-class Book:
-    title: str
-    author: str
-    description: str
-    parts: List[Part]
-
-
-@dataclass
-class PartStart:
-    title: str
-
-
-@dataclass
 class ChapterPdf:
     in_memory_file: BytesIO
 
@@ -59,9 +43,47 @@ class ChapterPdfUrl:
     def download(self) -> ChapterPdf:
         """Download pdf to in-memory file."""
         logging.info(f"Downloading {self.pdf_url}")
+
         response = requests.get(self.pdf_url)
         in_memory_file = BytesIO(response.content)
         return ChapterPdf(in_memory_file)
+
+
+@dataclass
+class Part:
+    title: str
+    page_num: int
+    chapters: List[Chapter]
+
+
+@dataclass
+class PartStart:
+    title: str
+
+
+# TODO: am i closing all pymupdf.open()'s correctly?
+
+
+@dataclass
+class Book:
+    title: str
+    author: str
+    description: str
+    parts: List[Part]
+    ordered_pdf_chapters: List[ChapterPdf]
+
+    def generate_merged_pdf(self) -> BytesIO:
+        logging.info("Generating merged pdf")
+        with pymupdf.open() as merged_doc:
+            for pdf in self.ordered_pdf_chapters:
+                with pymupdf.open(
+                    stream=pdf.in_memory_file, filetype="pdf"
+                ) as src_doc:
+                    merged_doc.insert_pdf(src_doc)
+
+            merged_pdf = BytesIO()
+            merged_doc.save(merged_pdf)
+            return merged_pdf
 
 
 def parse_chapter(
@@ -130,6 +152,8 @@ def scrape_chapters_table() -> Tuple[int, int, List[List[Cell]]]:
     """
     Return row count, col count and chapters table.
     """
+    logging.info(f"Scraping chapters table from {OSTEP_URL}")
+
     response = requests.get(OSTEP_URL)
     soup = BeautifulSoup(response.text, "html.parser")
 
@@ -169,9 +193,10 @@ def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
     curr_part_chapters: List[ChapterPdfUrl] = []
 
     match next(it):
-        case PartStart(title) as part_start:
+        case PartStart(_) as part_start:
             curr_part_start = part_start
         case _:
+
             raise Exception("first table entry must be a part start")
 
     for i in it:
@@ -201,16 +226,17 @@ def parse_book() -> Book:
     page_num = 0
 
     parts: List[Part] = []
-    # with tempfile.TemporaryDirectory(delete=True) as tmp_dir:
-    for part_start, chapter_pdf_paths in scrape_parts_chapter_pdfs():
+    ordered_chapter_pdfs: List[ChapterPdf] = []
+    for part_start, chapter_pdfs in scrape_parts_chapter_pdfs():
         # Assume the part starts at the first page of its first chapter.
         part_page_num = page_num
         part_title = part_start.title
 
         chapters: List[Chapter] = []
-        for path in chapter_pdf_paths:
-            chapter, page_count = parse_chapter(path, page_num)
+        for chapter_pdf in chapter_pdfs:
+            chapter, page_count = parse_chapter(chapter_pdf, page_num)
             chapters.append(chapter)
+            ordered_chapter_pdfs.append(chapter_pdf)
             page_num += page_count
 
         part = Part(part_title, part_page_num, chapters)
@@ -220,7 +246,7 @@ def parse_book() -> Book:
     title = ""
     author = ""
     description = ""
-    book = Book(title, author, description, parts)
+    book = Book(title, author, description, parts, ordered_chapter_pdfs)
 
     return book
 
@@ -229,6 +255,7 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO)
 
 
+# TODO: remove once done, only here to speed up debugging
 def setup_requests_cache():
     CACHE_DIR = "/tmp/ostep-downloader"
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -243,14 +270,14 @@ def main():
     setup_logging()
     setup_requests_cache()
 
-    # TODO: take as arg where to save output pdf
-
-    # print(parse_chapter("/home/fritz/Downloads/cpu-intro.pdf", 0))
-    # print(parse_chapter("/home/fritz/Downloads/dialogue-virtualization.pdf", 0))
-    # print(parse_chapter("/home/fritz/Downloads/toc.pdf", 0))
+    dst_file_path = sys.argv[1]
 
     book = parse_book()
-    pprint(book)
+
+    # Save merged pdf to output file.
+    in_memory_file = book.generate_merged_pdf()
+    with open(dst_file_path, "wb") as f:
+        f.write(in_memory_file.getbuffer())
 
 
 if __name__ == "__main__":
