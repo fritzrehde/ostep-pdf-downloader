@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import Enum
 from io import BytesIO
 import logging
 import os
@@ -11,49 +12,122 @@ import pymupdf
 import requests
 import requests_cache
 
-
-# TODO: maybe crop down to A4
-# TODO: maybe make as much as possible return iterators/generators instead of lists
+# TODO: add more logging when program takes a long time
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
+
+
+class Indexing(Enum):
+    Zero = 0
+    One = 1
+
+
+@dataclass
+class Offset:
+    offset: int
+
+    def apply(self, value: int) -> int:
+        return value + self.offset
+
+
+# TODO: use
+@dataclass
+class PageNum:
+    page_num: int
+    actual_indexing: Indexing
+    offset: Offset
+
+    # TODO: is it unsafe to provide global as default?
+    # def __init__(
+    #     self, page_num: int, actual_indexing: Indexing, _offset: Offset = offset
+    # ):
+    #     self.page_num = page_num
+    #     self.actual_indexing = actual_indexing
+    #     self.offset = _offset
+
+    def get(self, desired_indexing: Indexing) -> int:
+        page_num = self.offset.apply(self.page_num)
+        match (self.actual_indexing, desired_indexing):
+            case (Indexing.Zero, Indexing.Zero) | (Indexing.One, Indexing.One):
+                # Actual and desired indexing is the same.
+                return page_num
+            case (Indexing.Zero, Indexing.One):
+                # Convert 0-indexed to 1-indexed.
+                return page_num + 1
+            case (Indexing.One, Indexing.Zero):
+                # Convert 1-indexed to 0-indexed.
+                return page_num - 1
+            case _:
+                raise Exception("unreachable")
+
+    def add(self, pages: int):
+        self.page_num += pages
+
+
+@dataclass
+class TocEntry:
+    # 1-based.
+    lvl: int
+    title: str
+    # 1-based.
+    page_num: PageNum
+
+
+Toc = List[TocEntry]
 
 
 @dataclass
 class SubChapter:
     title: str
-    page_num: int
+    page_num: PageNum
+
+    def toc_entry(self) -> TocEntry:
+        # TODO: make page num 1-indexed.
+        return TocEntry(lvl=3, title=self.title, page_num=self.page_num)
 
 
 @dataclass
 class Chapter:
     title: str
-    page_num: int
+    page_num: PageNum
     subchapters: List[SubChapter]
+
+    def toc_entry(self) -> TocEntry:
+        # TODO: make page num 1-indexed.
+        return TocEntry(lvl=2, title=self.title, page_num=self.page_num)
 
 
 @dataclass
-class ChapterPdf:
-    in_memory_file: BytesIO
+class Pdf:
+    in_mem_file: BytesIO
+
+    def write_to_file(self, dst_file_path: str):
+        with open(dst_file_path, "wb") as f:
+            f.write(self.in_mem_file.getbuffer())
 
 
 @dataclass
 class ChapterPdfUrl:
     pdf_url: str
 
-    def download(self) -> ChapterPdf:
+    def download(self) -> Pdf:
         """Download pdf to in-memory file."""
         logging.info(f"Downloading {self.pdf_url}")
 
         response = requests.get(self.pdf_url)
-        in_memory_file = BytesIO(response.content)
-        return ChapterPdf(in_memory_file)
+        in_mem_file = BytesIO(response.content)
+        return Pdf(in_mem_file)
 
 
 @dataclass
 class Part:
     title: str
-    page_num: int
+    page_num: PageNum
     chapters: List[Chapter]
+
+    def toc_entry(self) -> TocEntry:
+        # TODO: make page num 1-indexed.
+        return TocEntry(lvl=1, title=self.title, page_num=self.page_num)
 
 
 @dataclass
@@ -64,35 +138,65 @@ class PartStart:
 # TODO: am i closing all pymupdf.open()'s correctly?
 
 
+def doc_to_pdf(doc) -> Pdf:
+    pdf = BytesIO()
+    doc.save(pdf)
+    return Pdf(pdf)
+
+
 @dataclass
 class Book:
     title: str
     author: str
     description: str
     parts: List[Part]
-    ordered_pdf_chapters: List[ChapterPdf]
+    ordered_pdf_chapters: List[Pdf]
 
-    def generate_merged_pdf(self) -> BytesIO:
+    # def _merge_pdf_chapters(self) -> BytesIO:
+
+    def build_toc(self) -> Toc:
+        toc: Toc = []
+
+        for part in self.parts:
+            toc.append(part.toc_entry())
+            for chapter in part.chapters:
+                toc.append(chapter.toc_entry())
+                for subchapter in chapter.subchapters:
+                    toc.append(subchapter.toc_entry())
+
+        return toc
+
+    def generate_merged_pdf(self) -> Pdf:
         logging.info("Generating merged pdf")
+        # in_mem_file = self._merge_pdf_chapters()
+        # return in_mem_file
+
         with pymupdf.open() as merged_doc:
+            # Add all chapter pdf files.
             for pdf in self.ordered_pdf_chapters:
                 with pymupdf.open(
-                    stream=pdf.in_memory_file, filetype="pdf"
+                    stream=pdf.in_mem_file, filetype="pdf"
                 ) as src_doc:
                     merged_doc.insert_pdf(src_doc)
 
-            merged_pdf = BytesIO()
-            merged_doc.save(merged_pdf)
-            return merged_pdf
+            # Add TOC.
+            toc = self.build_toc()
+            toc_formatted: List[Tuple[int, str, int]] = [
+                (x.lvl, x.title, x.page_num.get(desired_indexing=Indexing.One))
+                for x in toc
+            ]
+            merged_doc.set_toc(toc_formatted)
+
+            return doc_to_pdf(merged_doc)
 
 
 def parse_chapter(
-    chapter_pdf: ChapterPdf, starting_page_num: int
+    chapter_pdf: Pdf, starting_page_num: int, offset: Offset
 ) -> Tuple[Chapter, int]:
     """
     Return the parsed chapter and the number of pages in this chapter.
     """
-    doc = pymupdf.open(stream=chapter_pdf.in_memory_file, filetype="pdf")
+    doc = pymupdf.open(stream=chapter_pdf.in_mem_file, filetype="pdf")
     page_count = len(doc)
 
     chapter_idx = None
@@ -115,10 +219,17 @@ def parse_chapter(
                         chapter_idx = int(text)
                     elif 12 < font_size < 15:
                         chapter_title = text
-                        chapter_page_num = starting_page_num + page_num
+                        chapter_page_num = PageNum(
+                            starting_page_num + page_num, Indexing.Zero, offset
+                        )
                     elif 10 < font_size < 12:
                         subchapter = SubChapter(
-                            text, starting_page_num + page_num
+                            text,
+                            PageNum(
+                                starting_page_num + page_num,
+                                Indexing.Zero,
+                                offset,
+                            ),
                         )
                         subchapters.append(subchapter)
 
@@ -196,7 +307,6 @@ def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
         case PartStart(_) as part_start:
             curr_part_start = part_start
         case _:
-
             raise Exception("first table entry must be a part start")
 
     for i in it:
@@ -214,7 +324,10 @@ def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
     return parts
 
 
-def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[ChapterPdf]]]:
+def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
+    """
+    For each part (start), also return its chapter pdfs.
+    """
     # TODO: download in parallel across multiple threads
     return [
         (part, list(map(ChapterPdfUrl.download, chapter_urls)))
@@ -223,18 +336,22 @@ def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[ChapterPdf]]]:
 
 
 def parse_book() -> Book:
+    # Add the same mutable offset to every page number, so we can later add a
+    # cover page (offset = 1).
+    offset = Offset(0)
+
     page_num = 0
 
     parts: List[Part] = []
-    ordered_chapter_pdfs: List[ChapterPdf] = []
+    ordered_chapter_pdfs: List[Pdf] = []
     for part_start, chapter_pdfs in scrape_parts_chapter_pdfs():
         # Assume the part starts at the first page of its first chapter.
-        part_page_num = page_num
+        part_page_num = PageNum(page_num, Indexing.Zero, offset)
         part_title = part_start.title
 
         chapters: List[Chapter] = []
         for chapter_pdf in chapter_pdfs:
-            chapter, page_count = parse_chapter(chapter_pdf, page_num)
+            chapter, page_count = parse_chapter(chapter_pdf, page_num, offset)
             chapters.append(chapter)
             ordered_chapter_pdfs.append(chapter_pdf)
             page_num += page_count
@@ -247,6 +364,8 @@ def parse_book() -> Book:
     author = ""
     description = ""
     book = Book(title, author, description, parts, ordered_chapter_pdfs)
+
+    # TODO: add cover page
 
     return book
 
@@ -272,12 +391,12 @@ def main():
 
     dst_file_path = sys.argv[1]
 
+    # TODO: add option on whether to crop to A4
+
     book = parse_book()
 
-    # Save merged pdf to output file.
-    in_memory_file = book.generate_merged_pdf()
-    with open(dst_file_path, "wb") as f:
-        f.write(in_memory_file.getbuffer())
+    pdf = book.generate_merged_pdf()
+    pdf.write_to_file(dst_file_path)
 
 
 if __name__ == "__main__":
