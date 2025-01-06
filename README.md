@@ -7,3 +7,8 @@ Install [uv](https://docs.astral.sh/uv/) and run
 uv run main OSTEP.pdf
 ```
 to have the the generated PDF saved to `./OSTEP.pdf`.
+
+Execute the tests with
+```sh
+uv run pytest
+```

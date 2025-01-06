@@ -31,20 +31,11 @@ class Offset:
         return value + self.offset
 
 
-# TODO: use
 @dataclass
 class PageNum:
     page_num: int
     actual_indexing: Indexing
     offset: Offset
-
-    # TODO: is it unsafe to provide global as default?
-    # def __init__(
-    #     self, page_num: int, actual_indexing: Indexing, _offset: Offset = offset
-    # ):
-    #     self.page_num = page_num
-    #     self.actual_indexing = actual_indexing
-    #     self.offset = _offset
 
     def get(self, desired_indexing: Indexing) -> int:
         page_num = self.offset.apply(self.page_num)
@@ -70,7 +61,6 @@ class TocEntry:
     # 1-based.
     lvl: int
     title: str
-    # 1-based.
     page_num: PageNum
 
 
@@ -83,7 +73,6 @@ class SubChapter:
     page_num: PageNum
 
     def toc_entry(self) -> TocEntry:
-        # TODO: make page num 1-indexed.
         return TocEntry(lvl=3, title=self.title, page_num=self.page_num)
 
 
@@ -94,7 +83,6 @@ class Chapter:
     subchapters: List[SubChapter]
 
     def toc_entry(self) -> TocEntry:
-        # TODO: make page num 1-indexed.
         return TocEntry(lvl=2, title=self.title, page_num=self.page_num)
 
 
@@ -127,7 +115,6 @@ class Part:
     chapters: List[Chapter]
 
     def toc_entry(self) -> TocEntry:
-        # TODO: make page num 1-indexed.
         return TocEntry(lvl=1, title=self.title, page_num=self.page_num)
 
 
@@ -212,6 +199,8 @@ def parse_chapter(
                 #     font_size: float = span["size"]
                 #     text: str = span["text"].strip()
 
+                # TODO: some titles are split over multiple consecutive lines => maybe groupby the same font and size
+
                 # Some titles are split into multiple spans (on the same line),
                 # so merge all spans into one text line.
                 spans = line["spans"]
@@ -226,7 +215,8 @@ def parse_chapter(
                     chapter_page_num = PageNum(
                         starting_page_num + page_num, Indexing.Zero, offset
                     )
-                elif 10 < font_size < 12:
+                # Bad: 10.800
+                elif 10.9 < font_size < 11:
                     subchapter = SubChapter(
                         text,
                         PageNum(
@@ -400,8 +390,8 @@ def main():
     book = parse_book()
     # pprint(book)
 
-    pdf = book.generate_merged_pdf()
-    pdf.write_to_file(dst_file_path)
+    # pdf = book.generate_merged_pdf()
+    # pdf.write_to_file(dst_file_path)
 
 
 if __name__ == "__main__":
