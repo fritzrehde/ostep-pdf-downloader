@@ -12,6 +12,7 @@ import pymupdf
 import requests
 import requests_cache
 
+# TODO: rename to ostep-pdf-downloader
 # TODO: add more logging when program takes a long time
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
@@ -152,8 +153,6 @@ class Book:
     parts: List[Part]
     ordered_pdf_chapters: List[Pdf]
 
-    # def _merge_pdf_chapters(self) -> BytesIO:
-
     def build_toc(self) -> Toc:
         toc: Toc = []
 
@@ -168,8 +167,6 @@ class Book:
 
     def generate_merged_pdf(self) -> Pdf:
         logging.info("Generating merged pdf")
-        # in_mem_file = self._merge_pdf_chapters()
-        # return in_mem_file
 
         with pymupdf.open() as merged_doc:
             # Add all chapter pdf files.
@@ -207,31 +204,38 @@ def parse_chapter(
     for page_num in range(0, page_count):
         page = doc.load_page(page_num)
         page_dict = page.get_text("dict")
+        # pprint(page_dict)
 
         for block in page_dict["blocks"]:
             for line in block["lines"]:
-                for span in line["spans"]:
-                    font_size: float = span["size"]
-                    text: str = span["text"].strip()
+                # for span in line["spans"]:
+                #     font_size: float = span["size"]
+                #     text: str = span["text"].strip()
 
-                    # We identify headings by their (large) font sizes.
-                    if 20 < font_size and text.isdigit():
-                        chapter_idx = int(text)
-                    elif 12 < font_size < 15:
-                        chapter_title = text
-                        chapter_page_num = PageNum(
-                            starting_page_num + page_num, Indexing.Zero, offset
-                        )
-                    elif 10 < font_size < 12:
-                        subchapter = SubChapter(
-                            text,
-                            PageNum(
-                                starting_page_num + page_num,
-                                Indexing.Zero,
-                                offset,
-                            ),
-                        )
-                        subchapters.append(subchapter)
+                # Some titles are split into multiple spans (on the same line),
+                # so merge all spans into one text line.
+                spans = line["spans"]
+                font_size: float = spans[0]["size"]
+                text: str = "".join(span["text"] for span in spans)
+
+                # We identify headings by their (large) font sizes.
+                if 20 < font_size and text.isdigit():
+                    chapter_idx = int(text)
+                elif 12 < font_size < 15:
+                    chapter_title = text
+                    chapter_page_num = PageNum(
+                        starting_page_num + page_num, Indexing.Zero, offset
+                    )
+                elif 10 < font_size < 12:
+                    subchapter = SubChapter(
+                        text,
+                        PageNum(
+                            starting_page_num + page_num,
+                            Indexing.Zero,
+                            offset,
+                        ),
+                    )
+                    subchapters.append(subchapter)
 
     assert chapter_title is not None and chapter_page_num is not None
 
@@ -394,6 +398,7 @@ def main():
     # TODO: add option on whether to crop to A4
 
     book = parse_book()
+    # pprint(book)
 
     pdf = book.generate_merged_pdf()
     pdf.write_to_file(dst_file_path)
