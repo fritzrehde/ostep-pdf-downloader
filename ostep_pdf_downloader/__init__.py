@@ -14,7 +14,6 @@ import requests
 import requests_cache
 
 # TODO: rename to ostep-pdf-downloader
-# TODO: add more logging when program takes a long time
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
 
@@ -347,6 +346,7 @@ def parse_book() -> Book:
         chapters: List[Chapter] = []
         for chapter_pdf in chapter_pdfs:
             chapter, page_count = parse_chapter(chapter_pdf, page_num, offset)
+            logging.info(f"Parsing chapter: {chapter.title}")
             chapters.append(chapter)
             ordered_chapter_pdfs.append(chapter_pdf)
             page_num += page_count

@@ -118,7 +118,7 @@ wheels = [
 ]
 
 [[package]]
-name = "ostep-pdf-scraper"
+name = "ostep-pdf-downloader"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

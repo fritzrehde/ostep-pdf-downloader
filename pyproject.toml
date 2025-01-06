@@ -1,7 +1,7 @@
 [project]
-name = "ostep-pdf-scraper"
+name = "ostep-pdf-downloader"
 version = "0.1.0"
-description = "Add your description here"
+description = "Scrape and merge the OSTEP book into a PDF with embedded table of content"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,7 +16,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project.scripts]
-main = "ostep_pdf_scraper:main"
+main = "ostep_pdf_downloader:main"
 
 [tool.pytest.ini_options]
 python_files = ["*.py"]

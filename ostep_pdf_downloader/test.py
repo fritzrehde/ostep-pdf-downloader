@@ -1,5 +1,5 @@
 import re
-from ostep_pdf_scraper import parse_book, setup_requests_cache
+from ostep_pdf_downloader import parse_book, setup_requests_cache
 
 
 def test_parse_book():
