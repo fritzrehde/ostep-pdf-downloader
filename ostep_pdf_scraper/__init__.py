@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
+from itertools import groupby
 import logging
 import os
 from pprint import pprint
@@ -194,29 +195,29 @@ def parse_chapter(
         # pprint(page_dict)
 
         for block in page_dict["blocks"]:
-            for line in block["lines"]:
-                # for span in line["spans"]:
-                #     font_size: float = span["size"]
-                #     text: str = span["text"].strip()
+            for font_size, lines in groupby(
+                block["lines"], key=lambda line: line["spans"][0]["size"]
+            ):
+                # We define a "line block" as consecutive lines as long as they
+                # have the same font size, to enable parsing titles that span
+                # over multiple lines.
 
-                # TODO: some titles are split over multiple consecutive lines => maybe groupby the same font and size
-
-                # Some titles are split into multiple spans (on the same line),
-                # so merge all spans into one text line.
-                spans = line["spans"]
-                font_size: float = spans[0]["size"]
-                text: str = "".join(span["text"] for span in spans)
+                # The lines in a "line block" are joined with a space as separator.
+                text: str = " ".join(
+                    # Each line is joined together, ignoring differing fonts.
+                    ("".join(span["text"] for span in line["spans"]))
+                    for line in lines
+                )
 
                 # We identify headings by their (large) font sizes.
-                if 20 < font_size and text.isdigit():
+                if 20.662 < font_size and text.isdigit():
                     chapter_idx = int(text)
-                elif 12 < font_size < 15:
+                elif 12.575 < font_size < 12.576 or 14.346 < font_size < 14.347:
                     chapter_title = text
                     chapter_page_num = PageNum(
                         starting_page_num + page_num, Indexing.Zero, offset
                     )
-                # Bad: 10.800
-                elif 10.9 < font_size < 11:
+                elif 10.909 < font_size < 10.910:
                     subchapter = SubChapter(
                         text,
                         PageNum(
@@ -390,8 +391,8 @@ def main():
     book = parse_book()
     # pprint(book)
 
-    # pdf = book.generate_merged_pdf()
-    # pdf.write_to_file(dst_file_path)
+    pdf = book.generate_merged_pdf()
+    pdf.write_to_file(dst_file_path)
 
 
 if __name__ == "__main__":
