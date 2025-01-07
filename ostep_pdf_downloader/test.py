@@ -1,3 +1,4 @@
+import asyncio
 import re
 from ostep_pdf_downloader import parse_book, setup_requests_cache
 
@@ -31,7 +32,7 @@ def test_parse_book():
     # by anything.
     SUBCHAPTER_PATTERN = re.compile(r"^\d{1,2}\.\d{1,2} \w.+$")
 
-    book = parse_book()
+    book = asyncio.run(parse_book())
     for part in book.parts:
         assert part.title in PART_TITLES
 

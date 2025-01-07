@@ -9,6 +9,7 @@ dependencies = [
     "pymupdf>=1.25.1",
     "requests-cache>=1.2.1",
     "requests>=2.32.3",
+    "aiohttp>=3.11.11",
 ]
 
 [build-system]

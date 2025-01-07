@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from enum import Enum
 from io import BytesIO
@@ -8,12 +9,12 @@ from pprint import pprint
 import sys
 from typing import List, Tuple
 from urllib.parse import urljoin
+import aiohttp
 from bs4 import BeautifulSoup, Tag
 import pymupdf
 import requests
 import requests_cache
 
-# TODO: rename to ostep-pdf-downloader
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
 
@@ -99,13 +100,13 @@ class Pdf:
 class ChapterPdfUrl:
     pdf_url: str
 
-    def download(self) -> Pdf:
+    async def download(self, session: aiohttp.ClientSession) -> Pdf:
         """Download pdf to in-memory file."""
-        logging.info(f"Downloading {self.pdf_url}")
-
-        response = requests.get(self.pdf_url)
-        in_mem_file = BytesIO(response.content)
-        return Pdf(in_mem_file)
+        async with session.get(self.pdf_url) as response:
+            logging.info(f"Downloading {self.pdf_url}")
+            content = await response.read()
+            in_mem_file = BytesIO(content)
+            return Pdf(in_mem_file)
 
 
 @dataclass
@@ -191,7 +192,6 @@ def parse_chapter(
     for page_num in range(0, page_count):
         page = doc.load_page(page_num)
         page_dict = page.get_text("dict")
-        # pprint(page_dict)
 
         for block in page_dict["blocks"]:
             for font_size, lines in groupby(
@@ -318,18 +318,30 @@ def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
     return parts
 
 
-def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
+async def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
     """
     For each part (start), also return its chapter pdfs.
     """
-    # TODO: download in parallel across multiple threads
-    return [
-        (part, list(map(ChapterPdfUrl.download, chapter_urls)))
-        for (part, chapter_urls) in scrape_parts_chapter_urls()
-    ]
+    # Download pdf files concurrently.
+    async with aiohttp.ClientSession() as session:
+
+        async def download_chapters_for_part(
+            part: PartStart, chapter_urls: List[ChapterPdfUrl]
+        ) -> Tuple[PartStart, List[Pdf]]:
+            futures = [
+                chapter_url.download(session) for chapter_url in chapter_urls
+            ]
+            downloaded_pdfs = await asyncio.gather(*futures)
+            return part, downloaded_pdfs
+
+        futures = [
+            download_chapters_for_part(part, chapter_urls)
+            for (part, chapter_urls) in scrape_parts_chapter_urls()
+        ]
+        return await asyncio.gather(*futures)
 
 
-def parse_book() -> Book:
+async def parse_book() -> Book:
     # Add the same mutable offset to every page number, so we can later add a
     # cover page (offset = 1).
     offset = Offset(0)
@@ -338,7 +350,7 @@ def parse_book() -> Book:
 
     parts: List[Part] = []
     ordered_chapter_pdfs: List[Pdf] = []
-    for part_start, chapter_pdfs in scrape_parts_chapter_pdfs():
+    for part_start, chapter_pdfs in await scrape_parts_chapter_pdfs():
         # Assume the part starts at the first page of its first chapter.
         part_page_num = PageNum(page_num, Indexing.Zero, offset)
         part_title = part_start.title
@@ -380,19 +392,22 @@ def setup_requests_cache():
     )
 
 
-def main():
+async def _main():
     setup_logging()
-    setup_requests_cache()
+    # setup_requests_cache()
 
     dst_file_path = sys.argv[1]
 
     # TODO: add option on whether to crop to A4
 
-    book = parse_book()
-    # pprint(book)
+    book = await parse_book()
 
     pdf = book.generate_merged_pdf()
     pdf.write_to_file(dst_file_path)
+
+
+def main():
+    asyncio.run(_main())
 
 
 if __name__ == "__main__":
