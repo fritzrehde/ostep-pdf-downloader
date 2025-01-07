@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
@@ -578,9 +579,12 @@ def setup_logging():
 async def _main():
     setup_logging()
 
-    dst_file_path = sys.argv[1]
+    parser = ArgumentParser()
+    parser.add_argument("dst_file_path")
+    args = parser.parse_args()
+    dst_file_path = args.dst_file_path
 
-    # TODO: add option on whether to crop to A4
+    # TODO: add option on whether to crop to A4 (I find pages too tall)
 
     book = await parse_book()
 
