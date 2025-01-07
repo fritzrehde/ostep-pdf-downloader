@@ -210,7 +210,6 @@ def doc_to_pdf(doc) -> Pdf:
 class Book:
     title: str
     author: str
-    description: str
     cover_image: Jpg
     parts: List[Part]
     ordered_pdf_chapters: List[Pdf]
@@ -257,6 +256,10 @@ class Book:
                 for x in toc
             ]
             new_doc.set_toc(toc_formatted)
+
+            # Add metadata.
+            metadata = {"title": self.title, "author": self.author}
+            new_doc.set_metadata(metadata)
 
             return doc_to_pdf(new_doc)
 
@@ -405,7 +408,7 @@ def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
     return parts
 
 
-async def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
+async def download_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
     """
     For each part (start), also return its chapter pdfs.
     """
@@ -484,6 +487,22 @@ def parse_all_chapters(
     ]
 
 
+def scrape_metadata_title_author() -> Tuple[str, str]:
+    logging.info(f"Scraping metadata (title and author) from {OSTEP_URL}")
+
+    soup = ostep_soup()
+    blockquote = soup.find("blockquote")
+    lines = [
+        stripped
+        for line in blockquote.get_text().split("\n")
+        if (stripped := line.strip()) != ""
+    ]
+    title = lines[0]
+    author = lines[1]
+
+    return title, author
+
+
 def scrape_cover_image() -> Jpg:
     logging.info(f"Scraping cover image from {OSTEP_URL}")
 
@@ -506,7 +525,7 @@ async def parse_book() -> Book:
     # cover page (offset = 1).
     offset = Offset(0)
 
-    parts_chapter_pdfs = await scrape_parts_chapter_pdfs()
+    parts_chapter_pdfs = await download_parts_chapter_pdfs()
 
     ordered_chapter_pdfs: List[Pdf] = [
         pdf for _, pdfs in parts_chapter_pdfs for pdf in pdfs
@@ -538,15 +557,11 @@ async def parse_book() -> Book:
         parts.append(part)
 
     cover_image = scrape_cover_image()
+    title, author = scrape_metadata_title_author()
 
-    # TODO: scrape these too
-    title = ""
-    author = ""
-    description = ""
     book = Book(
         title,
         author,
-        description,
         cover_image,
         parts,
         ordered_chapter_pdfs,
