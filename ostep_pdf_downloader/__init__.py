@@ -575,20 +575,8 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO)
 
 
-# # TODO: remove once done, only here to speed up debugging
-# def setup_requests_cache():
-#     CACHE_DIR = "/tmp/ostep-downloader"
-#     os.makedirs(CACHE_DIR, exist_ok=True)
-#     requests_cache.install_cache(
-#         cache_name=CACHE_DIR,
-#         backend="filesystem",
-#         expire_after=None,
-#     )
-
-
 async def _main():
     setup_logging()
-    # setup_requests_cache()
 
     dst_file_path = sys.argv[1]
 
