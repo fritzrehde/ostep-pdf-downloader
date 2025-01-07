@@ -4,6 +4,7 @@ from enum import Enum
 from io import BytesIO
 from itertools import groupby
 import logging
+import multiprocessing
 import os
 from pprint import pprint
 import sys
@@ -53,8 +54,11 @@ class PageNum:
             case _:
                 raise Exception("unreachable")
 
-    def add(self, pages: int):
-        self.page_num += pages
+    def add_infront(self, page_count: int):
+        """
+        A given number of pages are added infront of this page.
+        """
+        self.page_num += page_count
 
 
 @dataclass
@@ -175,11 +179,11 @@ class Book:
             return doc_to_pdf(merged_doc)
 
 
-def parse_chapter(
-    chapter_pdf: Pdf, starting_page_num: int, offset: Offset
-) -> Tuple[Chapter, int]:
+def parse_chapter(chapter_pdf: Pdf, offset: Offset) -> Tuple[Chapter, int]:
     """
-    Return the parsed chapter and the number of pages in this chapter.
+    Return the parsed chapter and the number of pages in this chapter. The page
+    numbers of the chapters and subchapters will be relative to the page number
+    of start of the this chapter pdf.
     """
     doc = pymupdf.open(stream=chapter_pdf.in_mem_file, filetype="pdf")
     page_count = len(doc)
@@ -213,14 +217,12 @@ def parse_chapter(
                     chapter_idx = int(text)
                 elif 12.575 < font_size < 12.576 or 14.346 < font_size < 14.347:
                     chapter_title = text
-                    chapter_page_num = PageNum(
-                        starting_page_num + page_num, Indexing.Zero, offset
-                    )
+                    chapter_page_num = PageNum(page_num, Indexing.Zero, offset)
                 elif 10.909 < font_size < 10.910:
                     subchapter = SubChapter(
                         text,
                         PageNum(
-                            starting_page_num + page_num,
+                            page_num,
                             Indexing.Zero,
                             offset,
                         ),
@@ -233,6 +235,8 @@ def parse_chapter(
         chapter_title = f"{chapter_idx} {chapter_title}"
 
     chapter = Chapter(chapter_title, chapter_page_num, subchapters)
+
+    logging.info(f"Parsing chapter: {chapter.title}")
 
     return chapter, page_count
 
@@ -341,27 +345,77 @@ async def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
         return await asyncio.gather(*futures)
 
 
+# NOTE: The function executed in parellel across processes by multiprocessing
+# must be a top-level function so it can be pickled.
+def exec_task(input) -> Tuple[str, Tuple[Chapter, int]]:
+    part_title, chapter_pdf, offset = input
+    return part_title, parse_chapter(chapter_pdf, offset)
+
+
+def parse_all_chapters(
+    parts_chapter_pdfs: List[Tuple[PartStart, List[Pdf]]], offset: Offset
+) -> List[Tuple[str, List[Tuple[Chapter, int]]]]:
+    """
+    Returns [(part title, [(chapter, chapter page count)])].
+    """
+    # `parse_chapter` is the CPU-bound function, so need to create a flat task
+    # list to parallelise.
+    tasks = [
+        (part_start.title, chapter_pdf, offset)
+        for (part_start, chapter_pdfs) in parts_chapter_pdfs
+        for chapter_pdf in chapter_pdfs
+    ]
+
+    # This is parallelised across multiple processes.
+    with multiprocessing.Pool() as pool:
+        results = pool.map(exec_task, tasks)
+
+    def get_part_title(results_item: Tuple[str, Tuple[Chapter, int]]) -> str:
+        (part_title, (_chapter, _page_count)) = results_item
+        return part_title
+
+    # Join back together by grouping by part title.
+    return [
+        (
+            part_title,
+            [(chapter, page_count) for (_, (chapter, page_count)) in group],
+        )
+        for part_title, group in groupby(results, key=get_part_title)
+    ]
+
+
 async def parse_book() -> Book:
     # Add the same mutable offset to every page number, so we can later add a
     # cover page (offset = 1).
     offset = Offset(0)
 
-    page_num = 0
+    parts_chapter_pdfs = await scrape_parts_chapter_pdfs()
 
+    ordered_chapter_pdfs: List[Pdf] = [
+        pdf for _, pdfs in parts_chapter_pdfs for pdf in pdfs
+    ]
+
+    page_num = 0
     parts: List[Part] = []
-    ordered_chapter_pdfs: List[Pdf] = []
-    for part_start, chapter_pdfs in await scrape_parts_chapter_pdfs():
+    for part_title, chapters_page_counts in parse_all_chapters(
+        parts_chapter_pdfs, offset
+    ):
         # Assume the part starts at the first page of its first chapter.
         part_page_num = PageNum(page_num, Indexing.Zero, offset)
-        part_title = part_start.title
 
-        chapters: List[Chapter] = []
-        for chapter_pdf in chapter_pdfs:
-            chapter, page_count = parse_chapter(chapter_pdf, page_num, offset)
-            logging.info(f"Parsing chapter: {chapter.title}")
-            chapters.append(chapter)
-            ordered_chapter_pdfs.append(chapter_pdf)
+        # Convert relative (within chapters) into absolute (within whole book)
+        # page numbers.
+        for chapter, page_count in chapters_page_counts:
+            chapter.page_num.add_infront(page_num)
+
+            for subchapter in chapter.subchapters:
+                subchapter.page_num.add_infront(page_num)
+
             page_num += page_count
+
+        chapters: List[Chapter] = [
+            chapter for (chapter, _) in chapters_page_counts
+        ]
 
         part = Part(part_title, part_page_num, chapters)
         parts.append(part)
@@ -370,7 +424,13 @@ async def parse_book() -> Book:
     title = ""
     author = ""
     description = ""
-    book = Book(title, author, description, parts, ordered_chapter_pdfs)
+    book = Book(
+        title,
+        author,
+        description,
+        parts,
+        ordered_chapter_pdfs,
+    )
 
     # TODO: add cover page
 
@@ -381,15 +441,15 @@ def setup_logging():
     logging.basicConfig(level=logging.INFO)
 
 
-# TODO: remove once done, only here to speed up debugging
-def setup_requests_cache():
-    CACHE_DIR = "/tmp/ostep-downloader"
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    requests_cache.install_cache(
-        cache_name=CACHE_DIR,
-        backend="filesystem",
-        expire_after=None,
-    )
+# # TODO: remove once done, only here to speed up debugging
+# def setup_requests_cache():
+#     CACHE_DIR = "/tmp/ostep-downloader"
+#     os.makedirs(CACHE_DIR, exist_ok=True)
+#     requests_cache.install_cache(
+#         cache_name=CACHE_DIR,
+#         backend="filesystem",
+#         expire_after=None,
+#     )
 
 
 async def _main():

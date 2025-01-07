@@ -1,14 +1,17 @@
 import asyncio
 import re
-from ostep_pdf_downloader import parse_book, setup_requests_cache
+from ostep_pdf_downloader import parse_book
 
 
 def test_parse_book():
-    # TODO: remove
-    setup_requests_cache()
+    # Test that titles (of parts, chapters and subchapters) are either one of
+    # the hardcoded special titles, or adhere to a more general regex.
+    # In my opinion, this approach involved too much "hardcoding" for the actual
+    # parsing, but is great for testing, since my assumptions == the hardcoded
+    # values, so if the hardcoded values no longer pass, I need to revisit my
+    # assumptions.
 
-    # TODO: write a test that asserts that chapters adhere to a regex (too "hardcoded" for parsing, but great for testing, since if my assumptions were wrong (now due to changes), i want to know)
-    PART_TITLES = {
+    SPECIAL_PART_TITLES = {
         "Intro",
         "Virtualization",
         "Concurrency",
@@ -34,7 +37,7 @@ def test_parse_book():
 
     book = asyncio.run(parse_book())
     for part in book.parts:
-        assert part.title in PART_TITLES
+        assert part.title in SPECIAL_PART_TITLES
 
         for chapter in part.chapters:
             assert (
@@ -47,3 +50,6 @@ def test_parse_book():
                     subchapter.title in SPECIAL_SUBCHAPTER_TITLES
                     or SUBCHAPTER_PATTERN.search(subchapter.title) is not None
                 )
+
+
+# TODO: hardcode test to check page numbers are correct (just choose one chapter and subchapter and hardcode their pagenums)
