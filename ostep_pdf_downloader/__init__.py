@@ -1,11 +1,11 @@
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
+import functools
 from io import BytesIO
 from itertools import groupby
 import logging
 import multiprocessing
-import os
 from pprint import pprint
 import sys
 from typing import List, Tuple
@@ -14,10 +14,20 @@ import aiohttp
 from bs4 import BeautifulSoup, Tag
 import pymupdf
 import requests
-import requests_cache
+from PIL import Image
 
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
+
+
+def get_soup(url: str) -> BeautifulSoup:
+    response = requests.get(url)
+    return BeautifulSoup(response.text, "html.parser")
+
+
+@functools.cache
+def ostep_soup() -> BeautifulSoup:
+    return get_soup(OSTEP_URL)
 
 
 class Indexing(Enum):
@@ -29,6 +39,9 @@ class Indexing(Enum):
 class Offset:
     offset: int
 
+    def change(self, delta: int):
+        self.offset += delta
+
     def apply(self, value: int) -> int:
         return value + self.offset
 
@@ -37,6 +50,7 @@ class Offset:
 class PageNum:
     page_num: int
     actual_indexing: Indexing
+    # A pointer to an offset shared by all pages.
     offset: Offset
 
     def get(self, desired_indexing: Indexing) -> int:
@@ -62,6 +76,17 @@ class PageNum:
 
 
 @dataclass
+class PendingPageNum:
+    """A PageNum missing the offset field."""
+
+    page_num: int
+    actual_indexing: Indexing
+
+    def to_page_num(self, offset: Offset) -> PageNum:
+        return PageNum(self.page_num, self.actual_indexing, offset)
+
+
+@dataclass
 class TocEntry:
     # 1-based.
     lvl: int
@@ -82,6 +107,17 @@ class SubChapter:
 
 
 @dataclass
+class PendingSubChapter:
+    """A SubChapter where the PageNum is missing the offset field."""
+
+    title: str
+    pending_page_num: PendingPageNum
+
+    def to_subchapter(self, offset: Offset) -> SubChapter:
+        return SubChapter(self.title, self.pending_page_num.to_page_num(offset))
+
+
+@dataclass
 class Chapter:
     title: str
     page_num: PageNum
@@ -92,12 +128,48 @@ class Chapter:
 
 
 @dataclass
+class PendingChapter:
+    """A SubChapter where the PageNum is missing the offset field."""
+
+    title: str
+    pending_page_num: PendingPageNum
+    pending_subchapters: List[PendingSubChapter]
+
+    def to_chapter(self, offset: Offset) -> Chapter:
+        return Chapter(
+            self.title,
+            self.pending_page_num.to_page_num(offset),
+            [
+                pending_subchapter.to_subchapter(offset)
+                for pending_subchapter in self.pending_subchapters
+            ],
+        )
+
+
+@dataclass
 class Pdf:
     in_mem_file: BytesIO
+
+    def height_width(self) -> Tuple[int, int]:
+        with pymupdf.open(stream=self.in_mem_file, filetype="pdf") as doc:
+            first_page = doc[0].rect
+            return int(first_page.height), int(first_page.width)
 
     def write_to_file(self, dst_file_path: str):
         with open(dst_file_path, "wb") as f:
             f.write(self.in_mem_file.getbuffer())
+
+
+@dataclass
+class Jpg:
+    in_mem_file: BytesIO
+
+    def fit_in_pdf(self, pdf_height: int, pdf_width: int) -> Pdf:
+        with Image.open(self.in_mem_file) as img:
+            scaled_img = img.resize((pdf_width, pdf_height))
+            in_mem_pdf = BytesIO()
+            scaled_img.save(in_mem_pdf, format="PDF")
+            return Pdf(in_mem_pdf)
 
 
 @dataclass
@@ -128,9 +200,6 @@ class PartStart:
     title: str
 
 
-# TODO: am i closing all pymupdf.open()'s correctly?
-
-
 def doc_to_pdf(doc) -> Pdf:
     pdf = BytesIO()
     doc.save(pdf)
@@ -142,8 +211,11 @@ class Book:
     title: str
     author: str
     description: str
+    cover_image: Jpg
     parts: List[Part]
     ordered_pdf_chapters: List[Pdf]
+    # Every page number has this offset.
+    offset: Offset
 
     def build_toc(self) -> Toc:
         toc: Toc = []
@@ -160,13 +232,23 @@ class Book:
     def generate_merged_pdf(self) -> Pdf:
         logging.info("Generating merged pdf")
 
-        with pymupdf.open() as merged_doc:
+        with pymupdf.open() as new_doc:
+            # Add cover image.
+            height, width = self.ordered_pdf_chapters[0].height_width()
+            cover_pdf = self.cover_image.fit_in_pdf(height, width)
+            with pymupdf.open(
+                stream=cover_pdf.in_mem_file, filetype="pdf"
+            ) as cover_doc:
+                new_doc.insert_pdf(cover_doc)
+            # Increment every page number.
+            self.offset.change(delta=+1)
+
             # Add all chapter pdf files.
             for pdf in self.ordered_pdf_chapters:
                 with pymupdf.open(
                     stream=pdf.in_mem_file, filetype="pdf"
-                ) as src_doc:
-                    merged_doc.insert_pdf(src_doc)
+                ) as chapter_doc:
+                    new_doc.insert_pdf(chapter_doc)
 
             # Add TOC.
             toc = self.build_toc()
@@ -174,71 +256,73 @@ class Book:
                 (x.lvl, x.title, x.page_num.get(desired_indexing=Indexing.One))
                 for x in toc
             ]
-            merged_doc.set_toc(toc_formatted)
+            new_doc.set_toc(toc_formatted)
 
-            return doc_to_pdf(merged_doc)
+            return doc_to_pdf(new_doc)
 
 
-def parse_chapter(chapter_pdf: Pdf, offset: Offset) -> Tuple[Chapter, int]:
+def parse_chapter(chapter_pdf: Pdf) -> Tuple[PendingChapter, int]:
     """
     Return the parsed chapter and the number of pages in this chapter. The page
     numbers of the chapters and subchapters will be relative to the page number
     of start of the this chapter pdf.
     """
-    doc = pymupdf.open(stream=chapter_pdf.in_mem_file, filetype="pdf")
-    page_count = len(doc)
+    with pymupdf.open(stream=chapter_pdf.in_mem_file, filetype="pdf") as doc:
+        page_count = len(doc)
 
-    chapter_idx = None
-    chapter_title = None
-    chapter_page_num = None
-    subchapters: List[SubChapter] = []
+        chapter_idx = None
+        chapter_title = None
+        chapter_page_num = None
+        subchapters: List[PendingSubChapter] = []
 
-    for page_num in range(0, page_count):
-        page = doc.load_page(page_num)
-        page_dict = page.get_text("dict")
+        for page_num in range(0, page_count):
+            page = doc.load_page(page_num)
+            page_dict = page.get_text("dict")
 
-        for block in page_dict["blocks"]:
-            for font_size, lines in groupby(
-                block["lines"], key=lambda line: line["spans"][0]["size"]
-            ):
-                # We define a "line block" as consecutive lines as long as they
-                # have the same font size, to enable parsing titles that span
-                # over multiple lines.
+            for block in page_dict["blocks"]:
+                for font_size, lines in groupby(
+                    block["lines"], key=lambda line: line["spans"][0]["size"]
+                ):
+                    # We define a "line block" as consecutive lines as long as
+                    # they have the same font size, to enable parsing titles
+                    # that span over multiple lines.
 
-                # The lines in a "line block" are joined with a space as separator.
-                text: str = " ".join(
-                    # Each line is joined together, ignoring differing fonts.
-                    ("".join(span["text"] for span in line["spans"]))
-                    for line in lines
-                )
-
-                # We identify headings by their (large) font sizes.
-                if 20.662 < font_size and text.isdigit():
-                    chapter_idx = int(text)
-                elif 12.575 < font_size < 12.576 or 14.346 < font_size < 14.347:
-                    chapter_title = text
-                    chapter_page_num = PageNum(page_num, Indexing.Zero, offset)
-                elif 10.909 < font_size < 10.910:
-                    subchapter = SubChapter(
-                        text,
-                        PageNum(
-                            page_num,
-                            Indexing.Zero,
-                            offset,
-                        ),
+                    # The lines in a "line block" are joined with a space as
+                    # separator.
+                    text: str = " ".join(
+                        # Each line is joined together, ignoring differing fonts.
+                        ("".join(span["text"] for span in line["spans"]))
+                        for line in lines
                     )
-                    subchapters.append(subchapter)
 
-    assert chapter_title is not None and chapter_page_num is not None
+                    # We identify headings by their (large) font sizes.
+                    if 20.662 < font_size and text.isdigit():
+                        chapter_idx = int(text)
+                    elif (
+                        12.575 < font_size < 12.576
+                        or 14.346 < font_size < 14.347
+                    ):
+                        chapter_title = text
+                        chapter_page_num = PendingPageNum(
+                            page_num, Indexing.Zero
+                        )
+                    elif 10.909 < font_size < 10.910:
+                        subchapter = PendingSubChapter(
+                            text,
+                            PendingPageNum(page_num, Indexing.Zero),
+                        )
+                        subchapters.append(subchapter)
 
-    if chapter_idx is not None:
-        chapter_title = f"{chapter_idx} {chapter_title}"
+        assert chapter_title is not None and chapter_page_num is not None
 
-    chapter = Chapter(chapter_title, chapter_page_num, subchapters)
+        if chapter_idx is not None:
+            chapter_title = f"{chapter_idx} {chapter_title}"
 
-    logging.info(f"Parsing chapter: {chapter.title}")
+        chapter = PendingChapter(chapter_title, chapter_page_num, subchapters)
 
-    return chapter, page_count
+        logging.info(f"Parsing chapter: {chapter.title}")
+
+        return chapter, page_count
 
 
 Cell = PartStart | ChapterPdfUrl | None
@@ -263,8 +347,7 @@ def scrape_chapters_table() -> Tuple[int, int, List[List[Cell]]]:
     """
     logging.info(f"Scraping chapters table from {OSTEP_URL}")
 
-    response = requests.get(OSTEP_URL)
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = ostep_soup()
 
     chapters_table = soup.find_all("table")[3]
     chapters_table_raw_rows = [
@@ -346,10 +429,11 @@ async def scrape_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
 
 
 # NOTE: The function executed in parellel across processes by multiprocessing
-# must be a top-level function so it can be pickled.
-def exec_task(input) -> Tuple[str, Tuple[Chapter, int]]:
-    part_title, chapter_pdf, offset = input
-    return part_title, parse_chapter(chapter_pdf, offset)
+# must be a top-level function so it can be pickled. The function's arguments
+# and return values are also pickled.
+def exec_task(input) -> Tuple[str, Tuple[PendingChapter, int]]:
+    part_title, chapter_pdf = input
+    return part_title, parse_chapter(chapter_pdf)
 
 
 def parse_all_chapters(
@@ -361,27 +445,60 @@ def parse_all_chapters(
     # `parse_chapter` is the CPU-bound function, so need to create a flat task
     # list to parallelise.
     tasks = [
-        (part_start.title, chapter_pdf, offset)
+        (part_start.title, chapter_pdf)
         for (part_start, chapter_pdfs) in parts_chapter_pdfs
         for chapter_pdf in chapter_pdfs
     ]
+
+    # NOTE: To share memory across processes, each of the tasks is pickled
+    # (serialized) and sent to a worker process. The task is then unpickled,
+    # executed, and the result is pickled again before being sent back to the
+    # main process. This implementation detail is crucial because it means each
+    # process receives and returns deep copies instead of references to task
+    # arguments. In my case, I have one global Offset that every PageNum should
+    # reference. However, during pickling, new Offset deep copies are created,
+    # which is not the intended behaviour. Fixing this bug required not
+    # including the Offsets as arguments and instead adding them in later on the
+    # main process.
 
     # This is parallelised across multiple processes.
     with multiprocessing.Pool() as pool:
         results = pool.map(exec_task, tasks)
 
-    def get_part_title(results_item: Tuple[str, Tuple[Chapter, int]]) -> str:
-        (part_title, (_chapter, _page_count)) = results_item
+    def get_part_title(
+        results_item: Tuple[str, Tuple[PendingChapter, int]]
+    ) -> str:
+        (part_title, (_pending_chapter, _page_count)) = results_item
         return part_title
 
     # Join back together by grouping by part title.
     return [
         (
             part_title,
-            [(chapter, page_count) for (_, (chapter, page_count)) in group],
+            [
+                (pending_chapter.to_chapter(offset), page_count)
+                for (_, (pending_chapter, page_count)) in group
+            ],
         )
         for part_title, group in groupby(results, key=get_part_title)
     ]
+
+
+def scrape_cover_image() -> Jpg:
+    logging.info(f"Scraping cover image from {OSTEP_URL}")
+
+    soup = ostep_soup()
+    img_tag = soup.find(
+        "img",
+        src=lambda text: text
+        and "book" in text.lower()
+        and ".jpg" in text.lower(),
+    )
+    cover_url = urljoin(OSTEP_URL, img_tag["src"])
+
+    response = requests.get(cover_url)
+    in_mem_file = BytesIO(response.content)
+    return Jpg(in_mem_file)
 
 
 async def parse_book() -> Book:
@@ -420,6 +537,8 @@ async def parse_book() -> Book:
         part = Part(part_title, part_page_num, chapters)
         parts.append(part)
 
+    cover_image = scrape_cover_image()
+
     # TODO: scrape these too
     title = ""
     author = ""
@@ -428,11 +547,11 @@ async def parse_book() -> Book:
         title,
         author,
         description,
+        cover_image,
         parts,
         ordered_chapter_pdfs,
+        offset,
     )
-
-    # TODO: add cover page
 
     return book
 
