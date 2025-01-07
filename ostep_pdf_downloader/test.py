@@ -1,9 +1,19 @@
 import asyncio
 import re
-from ostep_pdf_downloader import parse_book
+from ostep_pdf_downloader import (
+    Book,
+    Chapter,
+    Indexing,
+    Offset,
+    PageNum,
+    SubChapter,
+    parse_book,
+)
+
+book = asyncio.run(parse_book())
 
 
-def test_parse_book():
+def test_title_parsing():
     # Test that titles (of parts, chapters and subchapters) are either one of
     # the hardcoded special titles, or adhere to a more general regex.
     # In my opinion, this approach involved too much "hardcoding" for the actual
@@ -35,7 +45,6 @@ def test_parse_book():
     # by anything.
     SUBCHAPTER_PATTERN = re.compile(r"^\d{1,2}\.\d{1,2} \w.+$")
 
-    book = asyncio.run(parse_book())
     for part in book.parts:
         assert part.title in SPECIAL_PART_TITLES
 
@@ -52,4 +61,36 @@ def test_parse_book():
                 )
 
 
-# TODO: hardcode test to check page numbers are correct (just choose one chapter and subchapter and hardcode their pagenums)
+def get_all_chapters(book: Book):
+    for part in book.parts:
+        for chapter in part.chapters:
+            yield chapter
+
+
+def get_all_subchapters(book: Book):
+    for part in book.parts:
+        for chapter in part.chapters:
+            for subchapter in chapter.subchapters:
+                yield subchapter
+
+
+def test_page_num_parsing():
+    all_chapters = list(get_all_chapters(book))
+    all_subchapters = list(get_all_subchapters(book))
+
+    chapter = Chapter(
+        "Contents", PageNum(12, Indexing.Zero, Offset(0)), subchapters=[]
+    )
+    assert chapter in all_chapters
+
+    chapter = Chapter(
+        "11 Summary Dialogue on CPU Virtualization",
+        PageNum(145, Indexing.Zero, Offset(0)),
+        subchapters=[],
+    )
+    assert chapter in all_chapters
+
+    subchapter = SubChapter(
+        "7.7 Round Robin", PageNum(99, Indexing.Zero, Offset(0))
+    )
+    assert subchapter in all_subchapters
