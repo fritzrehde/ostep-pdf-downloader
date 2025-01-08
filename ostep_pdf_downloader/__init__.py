@@ -2,33 +2,26 @@ from argparse import ArgumentParser
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-import functools
 from io import BytesIO
 from itertools import groupby
 import logging
 import multiprocessing
-from pprint import pprint
-import sys
 from typing import List, Tuple
 from urllib.parse import urljoin
-import aiohttp
 from bs4 import BeautifulSoup, Tag
 import pymupdf
-import requests
 from PIL import Image
+from aiohttp import ClientSession
 
 
 OSTEP_URL = "https://pages.cs.wisc.edu/~remzi/OSTEP/"
 
 
-def get_soup(url: str) -> BeautifulSoup:
-    response = requests.get(url)
-    return BeautifulSoup(response.text, "html.parser")
-
-
-@functools.cache
-def ostep_soup() -> BeautifulSoup:
-    return get_soup(OSTEP_URL)
+async def get_soup(url: str, session: ClientSession) -> BeautifulSoup:
+    response = await session.get(url)
+    bytes = await response.read()
+    logging.info(f"Finished getting bs4 soup for {OSTEP_URL}")
+    return BeautifulSoup(bytes, "html.parser")
 
 
 class Indexing(Enum):
@@ -51,7 +44,7 @@ class Offset:
 class PageNum:
     page_num: int
     actual_indexing: Indexing
-    # A pointer to an offset shared by all pages.
+    # A pointer to an offset shared by all page numbers.
     offset: Offset
 
     def get(self, desired_indexing: Indexing) -> int:
@@ -130,7 +123,7 @@ class Chapter:
 
 @dataclass
 class PendingChapter:
-    """A SubChapter where the PageNum is missing the offset field."""
+    """A Chapter where the PageNum is missing the offset field."""
 
     title: str
     pending_page_num: PendingPageNum
@@ -161,6 +154,12 @@ class Pdf:
             f.write(self.in_mem_file.getbuffer())
 
 
+def doc_to_pdf(doc) -> Pdf:
+    pdf = BytesIO()
+    doc.save(pdf)
+    return Pdf(pdf)
+
+
 @dataclass
 class Jpg:
     in_mem_file: BytesIO
@@ -177,13 +176,15 @@ class Jpg:
 class ChapterPdfUrl:
     pdf_url: str
 
-    async def download(self, session: aiohttp.ClientSession) -> Pdf:
+    async def download(self, session: ClientSession) -> Pdf:
         """Download pdf to in-memory file."""
         async with session.get(self.pdf_url) as response:
-            logging.info(f"Downloading {self.pdf_url}")
             content = await response.read()
-            in_mem_file = BytesIO(content)
-            return Pdf(in_mem_file)
+        in_mem_file = BytesIO(content)
+        pdf = Pdf(in_mem_file)
+
+        logging.info(f"Finished downloading {self.pdf_url}")
+        return pdf
 
 
 @dataclass
@@ -201,16 +202,15 @@ class PartStart:
     title: str
 
 
-def doc_to_pdf(doc) -> Pdf:
-    pdf = BytesIO()
-    doc.save(pdf)
-    return Pdf(pdf)
+@dataclass
+class Metadata:
+    title: str
+    author: str
 
 
 @dataclass
 class Book:
-    title: str
-    author: str
+    metadata: Metadata
     cover_image: Jpg
     parts: List[Part]
     ordered_pdf_chapters: List[Pdf]
@@ -259,8 +259,16 @@ class Book:
             new_doc.set_toc(toc_formatted)
 
             # Add metadata.
-            metadata = {"title": self.title, "author": self.author}
+            metadata = {
+                "title": self.metadata.title,
+                "author": self.metadata.author,
+            }
             new_doc.set_metadata(metadata)
+
+            # # Crop every page to A4.
+            # a4_rect = pymupdf.Rect(0.0, 0.0, 595.0, 842.0)
+            # for page in new_doc:
+            #     page.set_cropbox(a4_rect)
 
             return doc_to_pdf(new_doc)
 
@@ -269,7 +277,7 @@ def parse_chapter(chapter_pdf: Pdf) -> Tuple[PendingChapter, int]:
     """
     Return the parsed chapter and the number of pages in this chapter. The page
     numbers of the chapters and subchapters will be relative to the page number
-    of start of the this chapter pdf.
+    of start of this chapter.
     """
     with pymupdf.open(stream=chapter_pdf.in_mem_file, filetype="pdf") as doc:
         page_count = len(doc)
@@ -324,13 +332,12 @@ def parse_chapter(chapter_pdf: Pdf) -> Tuple[PendingChapter, int]:
 
         chapter = PendingChapter(chapter_title, chapter_page_num, subchapters)
 
-        logging.info(f"Parsing chapter: {chapter.title}")
+        logging.info(f"Finished parsing chapter: {chapter.title}")
 
         return chapter, page_count
 
 
 Cell = PartStart | ChapterPdfUrl | None
-NonEmptyCell = PartStart | ChapterPdfUrl
 
 
 def parse_cell(td_tag: Tag) -> Cell:
@@ -345,15 +352,13 @@ def parse_cell(td_tag: Tag) -> Cell:
         return None
 
 
-def scrape_chapters_table() -> Tuple[int, int, List[List[Cell]]]:
+def scrape_chapters_table(
+    ostep_soup: BeautifulSoup,
+) -> Tuple[int, int, List[List[Cell]]]:
     """
     Return row count, col count and chapters table.
     """
-    logging.info(f"Scraping chapters table from {OSTEP_URL}")
-
-    soup = ostep_soup()
-
-    chapters_table = soup.find_all("table")[3]
+    chapters_table = ostep_soup.find_all("table")[3]
     chapters_table_raw_rows = [
         list(tr.find_all("td")) for tr in chapters_table.find_all("tr")
     ]
@@ -367,69 +372,95 @@ def scrape_chapters_table() -> Tuple[int, int, List[List[Cell]]]:
         ]
         for row in range(row_count)
     ]
+
+    logging.info(f"Finished scraping chapters table from {OSTEP_URL}")
     return row_count, col_count, chapters_table_rows
 
 
-def scrape_parts_chapter_urls() -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
+def group_parts_chapter_urls(
+    cells: List[PartStart | ChapterPdfUrl],
+) -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
     """
-    Return a tuples of the part start and the pdf urls to all chapters in that
+    Convert a flat list of cells to a list of parts where each part contains its
+    chapters.
+    """
+    if cells == []:
+        return []
+
+    head, *tail = cells
+
+    # The first cell must be a part start.
+    match head:
+        case PartStart(_) as part_start:
+            curr_part_start = part_start
+        case _:
+            raise Exception("first cell must be a part start")
+
+    # Collect chapters until the next part starts.
+    curr_part_chapters = []
+    i = 0
+    while i < len(tail):
+        match tail[i]:
+            case PartStart(_) as part_start:
+                # A new part start ends the current part.
+                break
+            case ChapterPdfUrl(_) as chapter_pdf:
+                curr_part_chapters.append(chapter_pdf)
+        i += 1
+    next_part_start_idx = i
+
+    return [(curr_part_start, curr_part_chapters)] + group_parts_chapter_urls(
+        tail[next_part_start_idx:]
+    )
+
+
+def scrape_parts_chapter_urls(
+    ostep_soup: BeautifulSoup,
+) -> List[Tuple[PartStart, List[ChapterPdfUrl]]]:
+    """
+    Return tuples of the part start and the pdf urls to all chapters in that
     part.
     """
-    row_count, col_count, chapters_table_rows = scrape_chapters_table()
+    row_count, col_count, chapters_table_rows = scrape_chapters_table(
+        ostep_soup
+    )
 
-    # Iterate through columns one by one, filtering out None cells.
+    # Iterate down columns one by one, filtering out None cells.
     it = iter(
         cell
         for col in range(col_count)
         for row in range(row_count)
         if (cell := chapters_table_rows[row][col]) is not None
     )
-
-    parts: List[Tuple[PartStart, List[ChapterPdfUrl]]] = []
-    curr_part_chapters: List[ChapterPdfUrl] = []
-
-    match next(it):
-        case PartStart(_) as part_start:
-            curr_part_start = part_start
-        case _:
-            raise Exception("first table entry must be a part start")
-
-    for i in it:
-        match i:
-            case ChapterPdfUrl(_) as chapter_pdf:
-                curr_part_chapters.append(chapter_pdf)
-            case PartStart(_) as part_start:
-                # This ends the previous part.
-                parts.append((curr_part_start, curr_part_chapters))
-
-                # Prepare for next part.
-                curr_part_start = part_start
-                curr_part_chapters = []
-
-    return parts
+    cells = list(it)
+    return group_parts_chapter_urls(cells)
 
 
-async def download_parts_chapter_pdfs() -> List[Tuple[PartStart, List[Pdf]]]:
+async def download_parts_chapter_pdfs(
+    ostep_session: ClientSession, ostep_soup: BeautifulSoup
+) -> List[Tuple[PartStart, List[Pdf]]]:
     """
     For each part (start), also return its chapter pdfs.
     """
-    # Download pdf files concurrently.
-    async with aiohttp.ClientSession() as session:
 
-        async def download_chapters_for_part(
-            part: PartStart, chapter_urls: List[ChapterPdfUrl]
-        ) -> Tuple[PartStart, List[Pdf]]:
-            futures = [
-                chapter_url.download(session) for chapter_url in chapter_urls
-            ]
-            downloaded_pdfs = await asyncio.gather(*futures)
-            return part, downloaded_pdfs
-
-        futures = [
-            download_chapters_for_part(part, chapter_urls)
-            for (part, chapter_urls) in scrape_parts_chapter_urls()
+    async def download_chapters_for_part(
+        part: PartStart, chapter_urls: List[ChapterPdfUrl]
+    ) -> Tuple[PartStart, List[Pdf]]:
+        tasks = [
+            chapter_url.download(ostep_session) for chapter_url in chapter_urls
         ]
-        return await asyncio.gather(*futures)
+        downloaded_pdfs = await asyncio.gather(*tasks)
+        return part, downloaded_pdfs
+
+    def cpu_bound():
+        return scrape_parts_chapter_urls(ostep_soup)
+
+    # Download pdf files concurrently.
+    tasks = [
+        download_chapters_for_part(part, chapter_urls)
+        for (part, chapter_urls) in await asyncio.to_thread(cpu_bound)
+    ]
+    return await asyncio.gather(*tasks)
 
 
 # NOTE: The function executed in parellel across processes by multiprocessing
@@ -480,6 +511,7 @@ def parse_all_chapters(
         (
             part_title,
             [
+                # Complete the chapter creation by adding ref to offset.
                 (pending_chapter.to_chapter(offset), page_count)
                 for (_, (pending_chapter, page_count)) in group
             ],
@@ -488,11 +520,8 @@ def parse_all_chapters(
     ]
 
 
-def scrape_metadata_title_author() -> Tuple[str, str]:
-    logging.info(f"Scraping metadata (title and author) from {OSTEP_URL}")
-
-    soup = ostep_soup()
-    blockquote = soup.find("blockquote")
+def scrape_metadata(ostep_soup: BeautifulSoup) -> Metadata:
+    blockquote = ostep_soup.find("blockquote")
     lines = [
         stripped
         for line in blockquote.get_text().split("\n")
@@ -500,25 +529,39 @@ def scrape_metadata_title_author() -> Tuple[str, str]:
     ]
     title = lines[0]
     author = lines[1]
+    metadata = Metadata(title, author)
 
-    return title, author
-
-
-def scrape_cover_image() -> Jpg:
-    logging.info(f"Scraping cover image from {OSTEP_URL}")
-
-    soup = ostep_soup()
-    img_tag = soup.find(
-        "img",
-        src=lambda text: text
-        and "book" in text.lower()
-        and ".jpg" in text.lower(),
+    logging.info(
+        f"Finished scraping metadata (title and author) from {OSTEP_URL}"
     )
-    cover_url = urljoin(OSTEP_URL, img_tag["src"])
 
-    response = requests.get(cover_url)
-    in_mem_file = BytesIO(response.content)
-    return Jpg(in_mem_file)
+    return metadata
+
+
+async def scrape_cover_image(ostep_soup: BeautifulSoup) -> Jpg:
+
+    def cpu_bound():
+        img_tag = ostep_soup.find(
+            "img",
+            src=lambda text: text
+            and "book" in text.lower()
+            and ".jpg" in text.lower(),
+        )
+        return urljoin(OSTEP_URL, img_tag["src"])
+
+    # NOTE: Run a synchronous cpu-bound task without blocking the event loop.
+    cover_url = await asyncio.to_thread(cpu_bound)
+
+    async with ClientSession() as session:
+        response = await session.get(cover_url)
+        # NOTE: read() needs to be inside "with" statement, otherwise
+        # use-after-free.
+        bytes = await response.read()
+    in_mem_file = BytesIO(bytes)
+    jpg = Jpg(in_mem_file)
+
+    logging.info(f"Finished scraping cover image from {OSTEP_URL}")
+    return jpg
 
 
 async def parse_book() -> Book:
@@ -526,17 +569,26 @@ async def parse_book() -> Book:
     # cover page (offset = 1).
     offset = Offset(0)
 
-    parts_chapter_pdfs = await download_parts_chapter_pdfs()
+    async with ClientSession() as ostep_session:
+        ostep_soup = await get_soup(OSTEP_URL, ostep_session)
+        # These tasks are IO-bound, so execute asynchronously.
+        tasks = (
+            download_parts_chapter_pdfs(ostep_session, ostep_soup),
+            scrape_cover_image(ostep_soup),
+        )
+        parts_chapter_pdfs, cover_image = await asyncio.gather(*tasks)
+        metadata = scrape_metadata(ostep_soup)
 
     ordered_chapter_pdfs: List[Pdf] = [
         pdf for _, pdfs in parts_chapter_pdfs for pdf in pdfs
     ]
 
+    def cpu_bound():
+        return parse_all_chapters(parts_chapter_pdfs, offset)
+
     page_num = 0
     parts: List[Part] = []
-    for part_title, chapters_page_counts in parse_all_chapters(
-        parts_chapter_pdfs, offset
-    ):
+    for part_title, chapters_page_counts in await asyncio.to_thread(cpu_bound):
         # Assume the part starts at the first page of its first chapter.
         part_page_num = PageNum(page_num, Indexing.Zero, offset)
 
@@ -557,12 +609,8 @@ async def parse_book() -> Book:
         part = Part(part_title, part_page_num, chapters)
         parts.append(part)
 
-    cover_image = scrape_cover_image()
-    title, author = scrape_metadata_title_author()
-
     book = Book(
-        title,
-        author,
+        metadata,
         cover_image,
         parts,
         ordered_chapter_pdfs,

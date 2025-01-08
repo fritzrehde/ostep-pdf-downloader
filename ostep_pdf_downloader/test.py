@@ -27,12 +27,21 @@ def test_title_parsing():
         "Concurrency",
         "Persistence",
         "Security",
+        "Appendices",
     }
 
-    SPECIAL_CHAPTER_TITLES = {"Preface", "Contents"}
-    # Chapters start with a number and then have at least one letter, followed
-    # by anything.
-    CHAPTER_PATTERN = re.compile(r"^\d{1,2} \w.+$")
+    SPECIAL_CHAPTER_TITLES = {
+        "Preface",
+        "Contents",
+        "Virtual Machine Monitors",
+        "Monitors (Deprecated)",
+    }
+    CHAPTER_PATTERNS = [
+        # Most chapters start with a number and then have at least one letter.
+        re.compile(r"^\d{1,2} \w.+$"),
+        re.compile(r"^A Dialogue on .+$"),
+        re.compile(r"^Laboratory: .+$"),
+    ]
 
     SPECIAL_SUBCHAPTER_TITLES = {
         "References",
@@ -43,15 +52,15 @@ def test_title_parsing():
     }
     # Subchapters start with a number.number and then have at least one letter, followed
     # by anything.
-    SUBCHAPTER_PATTERN = re.compile(r"^\d{1,2}\.\d{1,2} \w.+$")
+    SUBCHAPTER_PATTERN = re.compile(r"^(\d|\w){1,2}\.\d{1,2} \w.+$")
 
     for part in book.parts:
         assert part.title in SPECIAL_PART_TITLES
 
         for chapter in part.chapters:
-            assert (
-                chapter.title in SPECIAL_CHAPTER_TITLES
-                or CHAPTER_PATTERN.search(chapter.title) is not None
+            assert chapter.title in SPECIAL_CHAPTER_TITLES or any(
+                pat.search(chapter.title) is not None
+                for pat in CHAPTER_PATTERNS
             )
 
             for subchapter in chapter.subchapters:

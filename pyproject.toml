@@ -1,13 +1,12 @@
 [project]
 name = "ostep-pdf-downloader"
 version = "0.1.0"
-description = "Scrape and merge the OSTEP book into a PDF with embedded table of content"
+description = "Scrape and merge the OSTEP book into a PDF with embedded table of contents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "bs4>=0.0.2",
     "pymupdf>=1.25.1",
-    "requests>=2.32.3",
     "aiohttp>=3.11.11",
     "pillow>=11.1.0",
 ]
