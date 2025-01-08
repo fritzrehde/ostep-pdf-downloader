@@ -265,6 +265,7 @@ class Book:
             }
             new_doc.set_metadata(metadata)
 
+            # TODO
             # # Crop every page to A4.
             # a4_rect = pymupdf.Rect(0.0, 0.0, 595.0, 842.0)
             # for page in new_doc:
