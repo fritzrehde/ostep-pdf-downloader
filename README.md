@@ -8,7 +8,12 @@ uv run main OSTEP.pdf
 ```
 to have the the generated PDF saved to `./OSTEP.pdf`.
 
-Execute the tests with
+Personally, I found the book a little too tall to read comfortably on a tablet without wasting space, so I added an option to crop the book to a 4:3 aspect ratio, which you can enable with:
+```sh
+uv run main --crop OSTEP-cropped.pdf
+```
+
+You can some basic tests with
 ```sh
 uv run pytest
 ```

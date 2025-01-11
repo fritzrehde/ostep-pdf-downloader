@@ -144,10 +144,9 @@ class PendingChapter:
 class Pdf:
     in_mem_file: BytesIO
 
-    def height_width(self) -> Tuple[int, int]:
+    def page_rect(self) -> pymupdf.Rect:
         with pymupdf.open(stream=self.in_mem_file, filetype="pdf") as doc:
-            first_page = doc[0].rect
-            return int(first_page.height), int(first_page.width)
+            return doc[0].rect
 
     def write_to_file(self, dst_file_path: str):
         with open(dst_file_path, "wb") as f:
@@ -161,15 +160,71 @@ def doc_to_pdf(doc) -> Pdf:
 
 
 @dataclass
-class Jpg:
+class Img:
     in_mem_file: BytesIO
 
-    def fit_in_pdf(self, pdf_height: int, pdf_width: int) -> Pdf:
+    def height_width(self) -> Tuple[float, float]:
         with Image.open(self.in_mem_file) as img:
-            scaled_img = img.resize((pdf_width, pdf_height))
-            in_mem_pdf = BytesIO()
-            scaled_img.save(in_mem_pdf, format="PDF")
-            return Pdf(in_mem_pdf)
+            return img.height, img.width
+
+    def scale_to_fit_onto_page(self, page: pymupdf.Page) -> pymupdf.Rect:
+        """
+        We assume this image is taller than the page. Scale it down, mainting
+        height-width ratio. This only returns a Rect with scaled values, pymupdf
+        does the actual scaling of the image.
+        """
+        img_h, img_w = self.height_width()
+        page_h, page_w = (page.rect.height, page.rect.width)
+
+        # Our cover image is expected to be "taller" (ratio-wise) than
+        # the rect.
+        assert (img_h / img_w) > (page_h / page_w)
+
+        # Because the image is taller, it can be scaled down such that
+        # the scaled-down height matches the page's height.
+        img_scaled_h = page_h
+
+        # The height and width should scale down the same to maintain
+        # their ratio:
+        # ratio = (scaled height / height) = (scaled width / width)
+        scale_down_ratio = img_scaled_h / img_h
+        img_scaled_w = img_w * scale_down_ratio
+
+        # Since we're squeezing (by scaling, not cropping) a taller
+        # image into a smaller frame, there will be gaps on the left and
+        # right of the image in the frame.
+        width_gap = (page_w - img_scaled_w) / 2
+
+        # Center scaled image on page.
+        x0, y0 = width_gap, 0
+        x1, y1 = width_gap + img_scaled_w, img_scaled_h
+        return pymupdf.Rect(x0, y0, x1, y1)
+
+
+def crop_page_to_fit_height(
+    page_rect: pymupdf.Rect,
+    desired_height: float,
+    top_bottom_crop_ratio: float,
+) -> pymupdf.Rect:
+    """
+    Crop the height of a page to a desired height. Keep the width of the
+    page.
+    """
+    # We expect to have to make the page shorter or leave it the same.
+    assert page_rect.height >= desired_height
+
+    to_crop = page_rect.height - desired_height
+
+    # If we have to crop some vertical space, ratio how much to take
+    # from top vs bottom?
+    crop_top_perc = top_bottom_crop_ratio
+    crop_bottom_perc = 1 - crop_top_perc
+    crop_top = to_crop * crop_top_perc
+    crop_bottom = to_crop * crop_bottom_perc
+
+    x0, y0 = page_rect.x0, page_rect.y0 + crop_top
+    x1, y1 = page_rect.x1, page_rect.y1 - crop_bottom
+    return pymupdf.Rect(x0, y0, x1, y1)
 
 
 @dataclass
@@ -211,7 +266,7 @@ class Metadata:
 @dataclass
 class Book:
     metadata: Metadata
-    cover_image: Jpg
+    cover_image: Img
     parts: List[Part]
     ordered_pdf_chapters: List[Pdf]
     # Every page number has this offset.
@@ -229,18 +284,38 @@ class Book:
 
         return toc
 
-    def generate_merged_pdf(self) -> Pdf:
+    def generate_merged_pdf(self, should_crop: bool) -> Pdf:
         logging.info("Generating merged pdf")
 
+        page_rect = self.ordered_pdf_chapters[0].page_rect()
+
+        # We always maintain the original width.
+        desired_width = page_rect.width
+        if should_crop:
+            # ratio = (desired height / desired width)
+            ratio = 4 / 3
+            desired_height = ratio * desired_width
+        else:
+            desired_height = page_rect.height
+
         with pymupdf.open() as new_doc:
-            # Add cover image.
-            height, width = self.ordered_pdf_chapters[0].height_width()
-            cover_pdf = self.cover_image.fit_in_pdf(height, width)
-            with pymupdf.open(
-                stream=cover_pdf.in_mem_file, filetype="pdf"
-            ) as cover_doc:
-                new_doc.insert_pdf(cover_doc)
-            # Increment every page number.
+            # Create a cover page and insert cover image by scaling it to
+            # fit onto cover page. We colour the gaps left by shrinking the
+            # cover image height-wise in black to match the cover's colour.
+            cover_page: pymupdf.Page = new_doc.new_page(
+                height=desired_height, width=desired_width
+            )
+            black = (0, 0, 0)
+            cover_page.draw_rect(cover_page.rect, color=black, fill=black)
+            cover_img_rect = self.cover_image.scale_to_fit_onto_page(cover_page)
+            cover_page.insert_image(
+                rect=cover_img_rect,
+                stream=self.cover_image.in_mem_file,
+                keep_proportion=True,
+            )
+
+            # Adding one cover page causes every subsequent page number to be
+            # incremented.
             self.offset.change(delta=+1)
 
             # Add all chapter pdf files.
@@ -250,7 +325,7 @@ class Book:
                 ) as chapter_doc:
                     new_doc.insert_pdf(chapter_doc)
 
-            # Add TOC.
+            # Add table of contents.
             toc = self.build_toc()
             toc_formatted: List[Tuple[int, str, int]] = [
                 (x.lvl, x.title, x.page_num.get(desired_indexing=Indexing.One))
@@ -265,11 +340,13 @@ class Book:
             }
             new_doc.set_metadata(metadata)
 
-            # TODO
-            # # Crop every page to A4.
-            # a4_rect = pymupdf.Rect(0.0, 0.0, 595.0, 842.0)
-            # for page in new_doc:
-            #     page.set_cropbox(a4_rect)
+            # Crop non-cover pages to desired height-to-width ratio.
+            cropped_rect = crop_page_to_fit_height(
+                page_rect, desired_height, top_bottom_crop_ratio=0.7
+            )
+            non_cover_pages = (new_doc[i] for i in range(1, len(new_doc)))
+            for page in non_cover_pages:
+                page.set_cropbox(cropped_rect)
 
             return doc_to_pdf(new_doc)
 
@@ -296,9 +373,8 @@ def parse_chapter(chapter_pdf: Pdf) -> Tuple[PendingChapter, int]:
                 for font_size, lines in groupby(
                     block["lines"], key=lambda line: line["spans"][0]["size"]
                 ):
-                    # We define a "line block" as consecutive lines as long as
-                    # they have the same font size, to enable parsing titles
-                    # that span over multiple lines.
+                    # To parse titles spanning multiple lines, define a "line
+                    # block" as consecutive lines with the same font-size.
 
                     # The lines in a "line block" are joined with a space as
                     # separator.
@@ -539,7 +615,7 @@ def scrape_metadata(ostep_soup: BeautifulSoup) -> Metadata:
     return metadata
 
 
-async def scrape_cover_image(ostep_soup: BeautifulSoup) -> Jpg:
+async def scrape_cover_image(ostep_soup: BeautifulSoup) -> Img:
 
     def cpu_bound():
         img_tag = ostep_soup.find(
@@ -559,7 +635,7 @@ async def scrape_cover_image(ostep_soup: BeautifulSoup) -> Jpg:
         # use-after-free.
         bytes = await response.read()
     in_mem_file = BytesIO(bytes)
-    jpg = Jpg(in_mem_file)
+    jpg = Img(in_mem_file)
 
     logging.info(f"Finished scraping cover image from {OSTEP_URL}")
     return jpg
@@ -630,14 +706,19 @@ async def _main():
 
     parser = ArgumentParser()
     parser.add_argument("dst_file_path")
+    parser.add_argument(
+        "--crop",
+        action="store_true",
+        required=False,
+        help="crop every page to a 4:3 aspect ratio",
+    )
     args = parser.parse_args()
     dst_file_path = args.dst_file_path
-
-    # TODO: add option on whether to crop to A4 (I find pages too tall)
+    should_crop = args.crop
 
     book = await parse_book()
 
-    pdf = book.generate_merged_pdf()
+    pdf = book.generate_merged_pdf(should_crop)
     pdf.write_to_file(dst_file_path)
 
 
